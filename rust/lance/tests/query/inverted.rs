@@ -172,6 +172,16 @@ async fn test_inverted_with_filter() {
     .unwrap();
 
     DatasetTestCases::from_data(batch.clone())
+        .with_index_types(
+            "category",
+            [
+                None,
+                Some(IndexType::Bitmap),
+                Some(IndexType::BTree),
+                Some(IndexType::BloomFilter),
+                Some(IndexType::ZoneMap),
+            ],
+        )
         .run(|ds, original| async move {
             let mut ds = ds;
             let params = base_inverted_params(false);
@@ -242,15 +252,10 @@ async fn test_inverted_params_combinations() {
         let params = params.clone();
         let expected = expected.clone();
         DatasetTestCases::from_data(batch.clone())
+            .with_index_types_and_inverted_index_params("text", [Some(IndexType::Inverted)], params)
             .run(|ds, original| {
-                let params = params.clone();
                 let expected = expected.clone();
                 async move {
-                    let mut ds = ds;
-                    ds.create_index(&["text"], IndexType::Inverted, None, &params, true)
-                        .await
-                        .unwrap();
-
                     let query = FullTextSearchQuery::new("hello".to_string())
                         .with_column("text".to_string())
                         .unwrap();
