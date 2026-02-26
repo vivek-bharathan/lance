@@ -22,6 +22,21 @@
 // Remove after upgrading pyo3 to 0.23
 #![allow(clippy::useless_conversion)]
 
+#[cfg(all(
+    not(target_env = "msvc"),
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(all(
+    not(target_env = "msvc"),
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: Jemalloc = Jemalloc;
+
 use std::env;
 use std::fs::OpenOptions;
 use std::path::Path;

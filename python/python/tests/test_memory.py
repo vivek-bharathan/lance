@@ -15,9 +15,10 @@ memtest = pytest.importorskip(
 def test_insert_memory(tmp_path: Path):
     def batch_generator():
         # 5MB batches -> 100MB total
+        payloads = [bytes([i]) * (1024 * 1024) for i in range(5)]
         for _ in range(20):
             yield pa.RecordBatch.from_arrays(
-                [pa.array([b"x" * 1024 * 1024] * 5)], names=["data"]
+                [pa.array(payloads)], names=["data"]
             )
 
     reader = pa.RecordBatchReader.from_batches(
