@@ -78,6 +78,9 @@ default = []
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
 
+[target.'cfg(all(not(target_env = "msvc"), any(target_os = "linux", target_os = "macos"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["disable_initial_exec_tls"] }
+
 [profile.ci]
 debug = "line-tables-only"
 inherits = "dev"
