@@ -192,13 +192,15 @@ pub fn create_duplicate_row_error(
     row_idx: usize,
     on_columns: &[String],
 ) -> DataFusionError {
-    DataFusionError::Execution(
-        format!(
-            "Ambiguous merge insert: multiple source rows match the same target row on ({}). \
-                                This could lead to data corruption. Please ensure each target row is matched by at most one source row.",
-            format_key_values_on_columns(batch, row_idx, on_columns)
+    DataFusionError::External(
+        Box::new(
+            Error::invalid_input(format!(
+                    "Ambiguous merge inserts are prohibited: multiple source rows match the same target row on ({}). \
+                    Please ensure each target row is matched by at most one source row.",
+                    format_key_values_on_columns(batch, row_idx, on_columns)
+                ), location!())
+            )
         )
-    )
 }
 
 /// Describes how rows should be handled when there is no matching row in the source table
@@ -5591,11 +5593,10 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             "Expected merge insert to fail due to duplicate rows on key column."
         );
 
-        let error_msg = result.unwrap_err().to_string();
         assert!(
-            error_msg.contains("Ambiguous merge insert") && error_msg.contains("multiple source rows"),
-            "Expected error message to mention ambiguous merge insert and multiple source rows, got: {}",
-            error_msg
+            matches!(&result, &Err(Error::InvalidInput { ref source, .. }) if source.to_string().contains("Ambiguous merge insert") && source.to_string().contains("multiple source rows")),
+            "Expected error to be InvalidInput with message about ambiguous merge insert and multiple source rows, got: {:?}",
+            result
         );
     }
 
