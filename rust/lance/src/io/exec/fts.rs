@@ -254,6 +254,10 @@ pub struct MatchQueryExec {
     query: MatchQuery,
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
+    /// Optional override for the BM25 scorer normally built locally inside
+    /// `execute()`. External coordinators that aggregate corpus statistics
+    /// across hosts inject the global scorer through `with_base_scorer`.
+    base_scorer: Option<Arc<MemBM25Scorer>>,
 
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -300,9 +304,39 @@ impl MatchQueryExec {
             query,
             params,
             prefilter_source,
+            base_scorer: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Override the local BM25 scorer with one supplied externally (e.g. by a
+    /// distributed coordinator that aggregated per-host statistics). When set,
+    /// `execute()` skips the call to `build_global_bm25_scorer` and threads
+    /// this scorer down to `InvertedIndex::bm25_search`.
+    pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
+        self.base_scorer = Some(scorer);
+        self
+    }
+
+    pub fn query(&self) -> &MatchQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn prefilter_source(&self) -> &PreFilterSource {
+        &self.prefilter_source
+    }
+
+    pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
+        self.base_scorer.as_ref()
     }
 }
 
@@ -348,6 +382,7 @@ impl ExecutionPlan for MatchQueryExec {
                     query: self.query.clone(),
                     params: self.params.clone(),
                     prefilter_source: PreFilterSource::None,
+                    base_scorer: self.base_scorer.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -373,6 +408,7 @@ impl ExecutionPlan for MatchQueryExec {
                     query: self.query.clone(),
                     params: self.params.clone(),
                     prefilter_source,
+                    base_scorer: self.base_scorer.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -396,6 +432,7 @@ impl ExecutionPlan for MatchQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let preset_base_scorer = self.base_scorer.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -454,7 +491,10 @@ impl ExecutionPlan for MatchQueryExec {
                 }
             };
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-            let base_scorer = build_global_bm25_scorer(&indices, &tokens, &params)?;
+            let base_scorer = match preset_base_scorer {
+                Some(scorer) => scorer,
+                None => Arc::new(build_global_bm25_scorer(&indices, &tokens, &params)?),
+            };
 
             pre_filter.wait_for_ready().await?;
             let tokens = Arc::new(tokens);
@@ -466,7 +506,7 @@ impl ExecutionPlan for MatchQueryExec {
                 query.operator,
                 pre_filter,
                 metrics.clone(),
-                Arc::new(base_scorer),
+                base_scorer,
             )
             .await?;
             scores.iter_mut().for_each(|s| {
@@ -727,6 +767,9 @@ pub struct FlatMatchQueryExec {
     query: MatchQuery,
     params: FtsSearchParams,
     unindexed_input: Arc<dyn ExecutionPlan>,
+    /// Optional override for the BM25 scorer normally built locally inside
+    /// `execute()`. See [`MatchQueryExec::with_base_scorer`].
+    base_scorer: Option<Arc<MemBM25Scorer>>,
 
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -773,9 +816,32 @@ impl FlatMatchQueryExec {
             query,
             params,
             unindexed_input,
+            base_scorer: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Override the local BM25 scorer; see [`MatchQueryExec::with_base_scorer`].
+    pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
+        self.base_scorer = Some(scorer);
+        self
+    }
+
+    pub fn query(&self) -> &MatchQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
+        self.base_scorer.as_ref()
     }
 }
 
@@ -807,6 +873,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
             query: self.query.clone(),
             params: self.params.clone(),
             unindexed_input,
+            base_scorer: self.base_scorer.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -820,6 +887,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
         let ds = self.dataset.clone();
+        let preset_base_scorer = self.base_scorer.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
         let target_batch_size = context.session_config().batch_size();
@@ -845,12 +913,24 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         format!("FTS index for column {} has no segments", column),
                     ))?;
                     let mut tokenizer = first_index.tokenizer();
-                    let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-                    let base_scorer =
-                        build_global_bm25_scorer(&indices, &query_tokens, &FtsSearchParams::new())?;
+                    let base_scorer = match preset_base_scorer {
+                        Some(scorer) => (*scorer).clone(),
+                        None => {
+                            let query_tokens =
+                                collect_query_tokens(&query.terms, &mut tokenizer);
+                            build_global_bm25_scorer(
+                                &indices,
+                                &query_tokens,
+                                &FtsSearchParams::new(),
+                            )?
+                        }
+                    };
                     (tokenizer, Some(base_scorer))
                 }
-                None => (default_text_tokenizer(), None),
+                None => (
+                    default_text_tokenizer(),
+                    preset_base_scorer.map(|s| (*s).clone()),
+                ),
             };
 
             flat_bm25_search_stream(
@@ -903,6 +983,9 @@ pub struct PhraseQueryExec {
     query: PhraseQuery,
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
+    /// Optional override for the BM25 scorer normally built locally inside
+    /// `execute()`. See [`MatchQueryExec::with_base_scorer`].
+    base_scorer: Option<Arc<MemBM25Scorer>>,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -950,9 +1033,36 @@ impl PhraseQueryExec {
             query,
             params,
             prefilter_source,
+            base_scorer: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Override the local BM25 scorer; see [`MatchQueryExec::with_base_scorer`].
+    pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
+        self.base_scorer = Some(scorer);
+        self
+    }
+
+    pub fn query(&self) -> &PhraseQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn prefilter_source(&self) -> &PreFilterSource {
+        &self.prefilter_source
+    }
+
+    pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
+        self.base_scorer.as_ref()
     }
 }
 
@@ -991,6 +1101,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 query: self.query.clone(),
                 params: self.params.clone(),
                 prefilter_source: PreFilterSource::None,
+                base_scorer: self.base_scorer.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             },
@@ -1014,6 +1125,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     query: self.query.clone(),
                     params: self.params.clone(),
                     prefilter_source,
+                    base_scorer: self.base_scorer.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -1037,6 +1149,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let params = self.params.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let preset_base_scorer = self.base_scorer.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -1077,7 +1190,10 @@ impl ExecutionPlan for PhraseQueryExec {
             )))?;
             let mut tokenizer = first_index.tokenizer();
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-            let base_scorer = build_global_bm25_scorer(&indices, &tokens, &params)?;
+            let base_scorer = match preset_base_scorer {
+                Some(scorer) => scorer,
+                None => Arc::new(build_global_bm25_scorer(&indices, &tokens, &params)?),
+            };
 
             pre_filter.wait_for_ready().await?;
             let tokens = Arc::new(tokens);
@@ -1089,7 +1205,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 lance_index::scalar::inverted::query::Operator::And,
                 pre_filter,
                 metrics.clone(),
-                Arc::new(base_scorer),
+                base_scorer,
             )
             .await?;
             metrics.baseline_metrics.record_output(doc_ids.len());
@@ -1131,6 +1247,12 @@ pub struct BoostQueryExec {
     params: FtsSearchParams,
     positive: Arc<dyn ExecutionPlan>,
     negative: Arc<dyn ExecutionPlan>,
+    /// Optional override for the BM25 scorer. `BoostQueryExec` does not score
+    /// directly; the field is kept here so distributed coordinators can record
+    /// the global scorer alongside this exec for debugging/symmetry. The
+    /// scorer is not consumed by this exec — it must be propagated to the
+    /// underlying `MatchQueryExec` / `PhraseQueryExec` children.
+    base_scorer: Option<Arc<MemBM25Scorer>>,
 
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -1175,9 +1297,41 @@ impl BoostQueryExec {
             params,
             positive,
             negative,
+            base_scorer: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Attach a globally-aggregated BM25 scorer alongside this compound exec.
+    ///
+    /// Note: `BoostQueryExec` does not score directly. The scorer is recorded
+    /// here only as a convenience for distributed coordinators that bundle it
+    /// with the exec; callers must still inject the scorer into the underlying
+    /// `MatchQueryExec` / `PhraseQueryExec` children.
+    pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
+        self.base_scorer = Some(scorer);
+        self
+    }
+
+    pub fn query(&self) -> &BoostQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn positive(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.positive
+    }
+
+    pub fn negative(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.negative
+    }
+
+    pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
+        self.base_scorer.as_ref()
     }
 }
 
@@ -1220,6 +1374,7 @@ impl ExecutionPlan for BoostQueryExec {
             params: self.params.clone(),
             positive,
             negative,
+            base_scorer: self.base_scorer.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -1307,6 +1462,9 @@ pub struct BooleanQueryExec {
     should: Arc<dyn ExecutionPlan>,
     must: Option<Arc<dyn ExecutionPlan>>,
     must_not: Arc<dyn ExecutionPlan>,
+    /// Optional override for the BM25 scorer; see [`BoostQueryExec::with_base_scorer`].
+    /// Not consumed by this exec — must be propagated to leaf children.
+    base_scorer: Option<Arc<MemBM25Scorer>>,
 
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -1359,9 +1517,41 @@ impl BooleanQueryExec {
             must,
             should,
             must_not,
+            base_scorer: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Attach a globally-aggregated BM25 scorer alongside this compound exec.
+    /// See [`BoostQueryExec::with_base_scorer`] for caveats.
+    pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
+        self.base_scorer = Some(scorer);
+        self
+    }
+
+    pub fn query(&self) -> &BooleanQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn should(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.should
+    }
+
+    pub fn must(&self) -> Option<&Arc<dyn ExecutionPlan>> {
+        self.must.as_ref()
+    }
+
+    pub fn must_not(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.must_not
+    }
+
+    pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
+        self.base_scorer.as_ref()
     }
 }
 
@@ -1403,6 +1593,7 @@ impl ExecutionPlan for BooleanQueryExec {
                     should,
                     must: None,
                     must_not: self.must_not.clone(),
+                    base_scorer: self.base_scorer.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }))
@@ -1416,6 +1607,7 @@ impl ExecutionPlan for BooleanQueryExec {
                     should,
                     must: None,
                     must_not,
+                    base_scorer: self.base_scorer.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }))
@@ -1430,6 +1622,7 @@ impl ExecutionPlan for BooleanQueryExec {
                     should,
                     must: Some(must),
                     must_not,
+                    base_scorer: self.base_scorer.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }))
