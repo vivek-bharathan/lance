@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{AsArray, BooleanBuilder};
@@ -87,70 +87,10 @@ async fn open_fts_segments(
     .await
 }
 
-/// Collect the unique terms needed to build a shared BM25 scorer.
-///
-/// The scorer only needs corpus-level document frequencies, so we keep a deduplicated
-/// term list here instead of constructing a full `Tokens` object with positions.
-fn scorer_terms(
-    indices: &[Arc<InvertedIndex>],
-    query_tokens: &Tokens,
-    params: &FtsSearchParams,
-) -> Result<Vec<String>> {
-    let mut terms = Vec::new();
-    let mut seen = HashSet::new();
-
-    if !matches!(params.fuzziness, Some(n) if n != 0) {
-        for token in query_tokens {
-            if seen.insert(token.to_string()) {
-                terms.push(token.to_string());
-            }
-        }
-        return Ok(terms);
-    }
-
-    for index in indices {
-        let expanded = index.expand_fuzzy_tokens(query_tokens, params)?;
-        for idx in 0..expanded.len() {
-            let token = expanded.get_token(idx);
-            if seen.insert(token.to_string()) {
-                terms.push(token.to_string());
-            }
-        }
-    }
-    Ok(terms)
-}
-
-/// Build a shared BM25 scorer for a set of committed FTS segments.
-fn build_global_bm25_scorer(
-    indices: &[Arc<InvertedIndex>],
-    query_tokens: &Tokens,
-    params: &FtsSearchParams,
-) -> Result<MemBM25Scorer> {
-    let terms = scorer_terms(indices, query_tokens, params)?;
-    let first_index = indices.first().ok_or_else(|| {
-        Error::invalid_input("FTS index requires at least one segment".to_string())
-    })?;
-    let (mut total_tokens, mut num_docs, first_token_docs) =
-        first_index.bm25_stats_for_terms(&terms);
-    let mut token_docs = HashMap::with_capacity(terms.len());
-    for (term, count) in terms.iter().cloned().zip(first_token_docs.into_iter()) {
-        token_docs.insert(term, count);
-    }
-
-    for index in indices.iter().skip(1) {
-        let (segment_total_tokens, segment_num_docs, segment_token_docs) =
-            index.bm25_stats_for_terms(&terms);
-        total_tokens += segment_total_tokens;
-        num_docs += segment_num_docs;
-        for (term, count) in terms.iter().zip(segment_token_docs.into_iter()) {
-            *token_docs
-                .get_mut(term)
-                .expect("global scorer terms should already be initialized") += count;
-        }
-    }
-
-    Ok(MemBM25Scorer::new(total_tokens, num_docs, token_docs))
-}
+// `build_global_bm25_scorer` lives in `lance_index::scalar::inverted` so
+// external coordinators that aggregate per-host BM25 stats can reuse the same
+// arithmetic. Re-imported below at the call sites.
+use lance_index::scalar::inverted::build_global_bm25_scorer;
 
 async fn search_segments(
     indices: &[Arc<InvertedIndex>],
@@ -2270,5 +2210,234 @@ mod tests {
             boolean_line.contains(&format!("{PARTITIONS_SEARCHED_METRIC}={expected_total}")),
             "BooleanQuery metrics missing partitions_searched: {boolean_line}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_match_query_exec_with_base_scorer_matches_baseline() {
+        use arrow_array::{
+            ArrayRef, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
+            UInt64Array,
+        };
+        use arrow_schema::DataType;
+        use datafusion::physical_plan::ExecutionPlan;
+        use futures::TryStreamExt;
+        use lance_core::ROW_ID;
+        use lance_index::scalar::inverted::SCORE_COL;
+        use lance_index::scalar::inverted::build_global_bm25_scorer;
+        use lance_table::format::IndexMetadata;
+
+        use crate::Dataset;
+        use crate::dataset::WriteParams;
+        use crate::io::exec::utils::IndexMetrics;
+        use super::open_fts_segments;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        // Skewed term distributions across two fragments — "lance" is common in
+        // segment 0 and rare in segment 1 — so any local-IDF computation will
+        // disagree with the global-IDF baseline. That makes the test sensitive
+        // to a bug where `with_base_scorer` is silently ignored.
+        let batches = vec![
+            RecordBatch::try_from_iter(vec![
+                ("id", Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef),
+                (
+                    "text",
+                    Arc::new(StringArray::from(vec![
+                        Some("lance database"),
+                        Some("lance search"),
+                    ])) as ArrayRef,
+                ),
+            ])
+            .unwrap(),
+            RecordBatch::try_from_iter(vec![
+                ("id", Arc::new(Int32Array::from(vec![2, 3])) as ArrayRef),
+                (
+                    "text",
+                    Arc::new(StringArray::from(vec![
+                        Some("alpha beta"),
+                        Some("gamma lance"),
+                    ])) as ArrayRef,
+                ),
+            ])
+            .unwrap(),
+        ];
+        let schema = batches[0].schema();
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let mut ds = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                max_rows_per_group: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = InvertedIndexParams::new("simple".to_string(), Language::English)
+            .with_position(false)
+            .lower_case(true)
+            .stem(false)
+            .remove_stop_words(false)
+            .ascii_folding(false)
+            .max_token_length(None);
+        let fragment_ids = ds
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        assert!(
+            fragment_ids.len() >= 2,
+            "test setup should produce >= 2 fragments, got {}",
+            fragment_ids.len()
+        );
+
+        let mut metadatas = Vec::<IndexMetadata>::with_capacity(fragment_ids.len());
+        for fragment_id in fragment_ids {
+            let mut builder = ds
+                .create_index_builder(&["text"], IndexType::Inverted, &params)
+                .name("seg_fts".to_string())
+                .fragments(vec![fragment_id]);
+            metadatas.push(builder.execute_uncommitted().await.unwrap());
+        }
+        let segments = ds
+            .create_index_segment_builder()
+            .with_index_type(IndexType::Inverted)
+            .with_segments(metadatas.clone())
+            .build_all()
+            .await
+            .unwrap();
+        ds.commit_existing_index_segments("seg_fts", "text", segments)
+            .await
+            .unwrap();
+        assert_eq!(
+            ds.load_indices_by_name("seg_fts").await.unwrap().len(),
+            metadatas.len(),
+            "expected one committed segment per fragment"
+        );
+
+        let dataset = Arc::new(ds);
+        let query = MatchQuery::new("lance".to_string()).with_column(Some("text".to_string()));
+        let search_params = FtsSearchParams::default().with_limit(Some(10));
+
+        // Baseline: the existing path that builds the global scorer locally.
+        let baseline_exec = MatchQueryExec::new(
+            dataset.clone(),
+            query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+        );
+        let baseline_batches: Vec<RecordBatch> = baseline_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let baseline = concat_score_batches(&baseline_batches);
+        assert!(
+            !baseline.is_empty(),
+            "baseline should return at least one hit"
+        );
+
+        // Override: build the global scorer manually via the public helper, then
+        // construct the exec with the preset segments and the preset scorer.
+        let preset_segments = crate::index::scalar::inverted::load_segments(&dataset, "text")
+            .await
+            .unwrap()
+            .expect("FTS index just created");
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = IndexMetrics::new(&metrics_set, 0);
+        let indices = open_fts_segments(&dataset, "text", &preset_segments, &metrics)
+            .await
+            .unwrap();
+        assert!(
+            indices.len() >= 2,
+            "expected >= 2 segments to exercise global IDF, got {}",
+            indices.len()
+        );
+        let mut tokenizer = indices[0].tokenizer();
+        let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+        let global_scorer = Arc::new(
+            build_global_bm25_scorer(&indices, &tokens, &search_params).unwrap(),
+        );
+
+        let override_exec = MatchQueryExec::try_new_with_segments(
+            dataset.clone(),
+            query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+            preset_segments,
+        )
+        .with_base_scorer(global_scorer);
+        let override_batches: Vec<RecordBatch> = override_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let overridden = concat_score_batches(&override_batches);
+
+        assert_eq!(
+            baseline.len(),
+            overridden.len(),
+            "row count differs: baseline={}, override={}",
+            baseline.len(),
+            overridden.len()
+        );
+        for (i, (b, o)) in baseline.iter().zip(overridden.iter()).enumerate() {
+            assert_eq!(
+                b.0, o.0,
+                "row id mismatch at rank {}: baseline={}, override={}",
+                i, b.0, o.0
+            );
+            assert!(
+                (b.1 - o.1).abs() < 1e-5,
+                "score mismatch at rank {} (row id {}): baseline={}, override={}",
+                i,
+                b.0,
+                b.1,
+                o.1
+            );
+        }
+
+        // Sanity check on FTS schema before extracting columns above.
+        for batch in baseline_batches.iter().chain(override_batches.iter()) {
+            assert!(
+                batch.column_by_name(ROW_ID).is_some(),
+                "FTS output is expected to carry a row id column"
+            );
+            assert_eq!(
+                batch.column_by_name(SCORE_COL).unwrap().data_type(),
+                &DataType::Float32,
+                "FTS score column should be Float32"
+            );
+        }
+
+        // Locally-bound helper: collect (row_id, score) pairs sorted by score desc.
+        fn concat_score_batches(batches: &[RecordBatch]) -> Vec<(u64, f32)> {
+            let mut out: Vec<(u64, f32)> = Vec::new();
+            for batch in batches {
+                let row_ids = batch
+                    .column_by_name(ROW_ID)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap();
+                let scores = batch
+                    .column_by_name(SCORE_COL)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap();
+                for i in 0..batch.num_rows() {
+                    out.push((row_ids.value(i), scores.value(i)));
+                }
+            }
+            // Stable order for diffing — descending score, ties broken by row id.
+            out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            out
+        }
     }
 }
