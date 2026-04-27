@@ -4,7 +4,7 @@
 //! Utilities for integrating scalar indices with datasets
 //!
 
-pub(crate) mod inverted;
+pub mod inverted;
 
 use std::sync::{Arc, LazyLock};
 
