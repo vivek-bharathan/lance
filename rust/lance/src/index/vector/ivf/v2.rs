@@ -2170,7 +2170,8 @@ mod tests {
 
         let segments =
             build_segments_for_fragment_groups(dataset, fragment_groups, &params, index_name).await;
-        let committed_segments = build_distributed_segments(dataset, segments, index_name).await;
+        let committed_segments =
+            build_distributed_segments(dataset, segments, params.index_type(), index_name).await;
         assert!(!committed_segments.is_empty());
     }
 
@@ -2251,8 +2252,16 @@ mod tests {
     async fn build_distributed_segments(
         dataset: &mut Dataset,
         segments: Vec<IndexMetadata>,
+        index_type: IndexType,
         index_name: &str,
-    ) -> Vec<IndexMetadata> {
+    ) -> Vec<crate::index::api::IndexSegment> {
+        let segments = dataset
+            .create_index_segment_builder()
+            .with_index_type(index_type)
+            .with_segments(segments)
+            .build_all()
+            .await
+            .unwrap();
         dataset
             .commit_existing_index_segments(index_name, "vector", segments.clone())
             .await
@@ -2468,12 +2477,13 @@ mod tests {
             INDEX_NAME,
         )
         .await;
-        let segments = build_distributed_segments(&mut ds_split, segments, INDEX_NAME).await;
+        let segments =
+            build_distributed_segments(&mut ds_split, segments, index_type, INDEX_NAME).await;
         assert_eq!(segments.len(), expected_segment_count);
         for segment in &segments {
             let segment_index = ds_split
                 .indices_dir()
-                .child(segment.uuid.to_string())
+                .child(segment.uuid().to_string())
                 .child(crate::index::INDEX_FILE_NAME);
             assert!(
                 ds_split
@@ -2654,18 +2664,12 @@ mod tests {
         .await
         .unwrap();
         let grouped_segments =
-            build_distributed_segments(&mut ds_split, grouped_segments, INDEX_NAME).await;
+            build_distributed_segments(&mut ds_split, grouped_segments, index_type, INDEX_NAME)
+                .await;
         assert_eq!(grouped_segments.len(), expected_fragment_coverage.len());
         let mut actual_fragment_coverage = grouped_segments
             .iter()
-            .map(|segment| {
-                segment
-                    .fragment_bitmap
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .collect::<Vec<_>>()
-            })
+            .map(|segment| segment.fragment_bitmap().iter().collect::<Vec<_>>())
             .collect::<Vec<_>>();
         actual_fragment_coverage.sort();
         assert_eq!(
@@ -2794,6 +2798,14 @@ mod tests {
             segments.push(segment);
         }
 
+        let segments = dataset
+            .create_index_segment_builder()
+            .with_index_type(IndexType::IvfHnswFlat)
+            .with_segments(segments)
+            .build_all()
+            .await
+            .unwrap();
+
         dataset
             .commit_existing_index_segments("vector_idx", "vector", segments)
             .await
@@ -2863,8 +2875,15 @@ mod tests {
         )
         .await
         .unwrap();
+        let merged_segment = dataset
+            .create_index_segment_builder()
+            .with_index_type(params.index_type())
+            .with_segments(vec![merged_segment])
+            .build_all()
+            .await
+            .unwrap();
         dataset
-            .commit_existing_index_segments(INDEX_NAME, "vector", vec![merged_segment])
+            .commit_existing_index_segments(INDEX_NAME, "vector", merged_segment)
             .await
             .unwrap();
 

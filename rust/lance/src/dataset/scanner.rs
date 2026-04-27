@@ -81,6 +81,7 @@ use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
@@ -3310,20 +3311,14 @@ impl Scanner {
             "the column must be specified in the query".to_string(),
         ))?;
 
-        let index_meta = self
-            .dataset
-            .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
+        let segments = load_segments(&self.dataset, &column)
             .await?
             .ok_or(Error::invalid_input(format!(
                 "No Inverted index found for column {}",
                 column
             )))?;
+        let details = load_segment_details(&self.dataset, &column, &segments).await?;
 
-        let details_any =
-            crate::index::scalar::fetch_index_details(&self.dataset, &column, &index_meta).await?;
-        let details = details_any
-            .as_ref()
-            .to_msg::<lance_index::pbold::InvertedIndexDetails>()?;
         if !details.with_position {
             return Err(Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position"
                 .to_string()));
@@ -4890,6 +4885,13 @@ pub mod test_dataset {
                 .iter()
                 .map(|segment| segment.uuid)
                 .collect::<Vec<_>>();
+            let segments = self
+                .dataset
+                .create_index_segment_builder()
+                .with_index_type(params.index_type())
+                .with_segments(segments)
+                .build_all()
+                .await?;
             self.dataset
                 .commit_existing_index_segments("idx", "vec", segments)
                 .await?;

@@ -93,7 +93,7 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
-use crate::indices::{PyIndexConfig, PyIndexDescription};
+use crate::indices::{PyIndexConfig, PyIndexDescription, PyIndexSegment, PyIndexSegmentPlan};
 use crate::namespace::extract_namespace_arc;
 use crate::rt;
 use crate::scanner::ScanStatistics;
@@ -327,6 +327,106 @@ impl MergeInsertBuilder {
 
         rt().block_on(None, job.analyze_plan(new_data_stream))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+}
+
+#[pyclass(name = "IndexSegmentBuilder", module = "lance", subclass)]
+#[derive(Clone)]
+pub struct PyIndexSegmentBuilder {
+    dataset: Arc<LanceDataset>,
+    index_type: Option<IndexType>,
+    segments: Vec<IndexMetadata>,
+    target_segment_bytes: Option<u64>,
+}
+
+impl PyIndexSegmentBuilder {
+    fn builder(&self) -> <LanceDataset as DatasetIndexExt>::IndexSegmentBuilder<'_> {
+        let mut builder = self
+            .dataset
+            .create_index_segment_builder()
+            .with_segments(self.segments.clone());
+        if let Some(index_type) = self.index_type {
+            builder = builder.with_index_type(index_type);
+        }
+        if let Some(target_segment_bytes) = self.target_segment_bytes {
+            builder = builder.with_target_segment_bytes(target_segment_bytes);
+        }
+        builder
+    }
+}
+
+#[pymethods]
+impl PyIndexSegmentBuilder {
+    fn with_index_type<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        index_type: &str,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        let normalized = index_type.to_uppercase();
+        slf.index_type = Some(match normalized.as_str() {
+            "INVERTED" | "FTS" => IndexType::Inverted,
+            "VECTOR" => IndexType::Vector,
+            "IVF_FLAT" => IndexType::IvfFlat,
+            "IVF_PQ" => IndexType::IvfPq,
+            "IVF_SQ" => IndexType::IvfSq,
+            "IVF_RQ" => IndexType::IvfRq,
+            "IVF_HNSW_FLAT" => IndexType::IvfHnswFlat,
+            "IVF_HNSW_PQ" => IndexType::IvfHnswPq,
+            "IVF_HNSW_SQ" => IndexType::IvfHnswSq,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Unsupported index type for segment builder: {index_type}"
+                )));
+            }
+        });
+        Ok(slf)
+    }
+
+    fn with_segments<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        segments: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        let mut indices = Vec::new();
+        for item in segments.try_iter()? {
+            indices.push(item?.extract::<PyLance<IndexMetadata>>()?.0);
+        }
+        slf.segments = indices;
+        Ok(slf)
+    }
+
+    fn with_target_segment_bytes<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        bytes: u64,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        slf.target_segment_bytes = Some(bytes);
+        Ok(slf)
+    }
+
+    fn plan(&self, py: Python<'_>) -> PyResult<Vec<Py<PyIndexSegmentPlan>>> {
+        let plans = rt()
+            .block_on(Some(py), self.builder().plan())?
+            .infer_error()?;
+        plans
+            .into_iter()
+            .map(|plan| Py::new(py, PyIndexSegmentPlan::from_inner(plan)))
+            .collect()
+    }
+
+    fn build(&self, py: Python<'_>, plan: &Bound<'_, PyAny>) -> PyResult<Py<PyIndexSegment>> {
+        let plan = plan.extract::<PyRef<'_, PyIndexSegmentPlan>>()?;
+        let segment = rt()
+            .block_on(Some(py), self.builder().build(&plan.inner))?
+            .infer_error()?;
+        Py::new(py, PyIndexSegment::from_inner(segment))
+    }
+
+    fn build_all(&self, py: Python<'_>) -> PyResult<Vec<Py<PyIndexSegment>>> {
+        let segments = rt()
+            .block_on(Some(py), self.builder().build_all())?
+            .infer_error()?;
+        segments
+            .into_iter()
+            .map(|segment| Py::new(py, PyIndexSegment::from_inner(segment)))
+            .collect()
     }
 }
 
@@ -1486,7 +1586,7 @@ impl Dataset {
 
     /// Fetches the currently checked out version of the dataset.
     fn version(&self) -> PyResult<u64> {
-        Ok(self.ds.version_id())
+        Ok(self.ds.version().version)
     }
 
     fn latest_version(self_: PyRef<'_, Self>) -> PyResult<u64> {
@@ -1773,7 +1873,6 @@ impl Dataset {
         for (name, meta) in branches.iter() {
             let dict = PyDict::new(py);
             dict.set_item("parent_branch", meta.parent_branch.clone())?;
-            dict.set_item("branch_identifier", meta.identifier.version_mapping.clone())?;
             dict.set_item("parent_version", meta.parent_version)?;
             dict.set_item("create_at", meta.create_at)?;
             dict.set_item("manifest_size", meta.manifest_size)?;
@@ -1808,7 +1907,6 @@ impl Dataset {
         for (name, meta) in ordered.into_iter() {
             let dict = PyDict::new(py);
             dict.set_item("parent_branch", meta.parent_branch.clone())?;
-            dict.set_item("branch_identifier", meta.identifier.version_mapping.clone())?;
             dict.set_item("parent_version", meta.parent_version)?;
             dict.set_item("create_at", meta.create_at)?;
             dict.set_item("manifest_size", meta.manifest_size)?;
@@ -2054,6 +2152,15 @@ impl Dataset {
         Ok(PyLance(index_metadata))
     }
 
+    fn create_index_segment_builder(&self) -> PyResult<PyIndexSegmentBuilder> {
+        Ok(PyIndexSegmentBuilder {
+            dataset: self.ds.clone(),
+            index_type: None,
+            segments: Vec::new(),
+            target_segment_bytes: None,
+        })
+    }
+
     fn merge_existing_index_segments(
         &self,
         segments: Vec<PyLance<IndexMetadata>>,
@@ -2072,16 +2179,16 @@ impl Dataset {
         &mut self,
         index_name: &str,
         column: &str,
-        segments: Vec<PyLance<IndexMetadata>>,
+        segments: Vec<PyRef<'_, PyIndexSegment>>,
     ) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
+        let segments = segments
+            .into_iter()
+            .map(|segment| segment.inner.clone())
+            .collect();
         rt().block_on(
             None,
-            new_self.commit_existing_index_segments(
-                index_name,
-                column,
-                segments.into_iter().map(|segment| segment.0).collect(),
-            ),
+            new_self.commit_existing_index_segments(index_name, column, segments),
         )?
         .infer_error()?;
         self.ds = Arc::new(new_self);
@@ -3190,7 +3297,7 @@ impl Dataset {
         } else {
             Ok(Ref::Version(
                 self.ds.manifest.branch.clone(),
-                Some(self.ds.version_id()),
+                Some(self.ds.version().version),
             ))
         }
     }
