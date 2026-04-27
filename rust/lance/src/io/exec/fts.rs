@@ -258,6 +258,11 @@ pub struct MatchQueryExec {
     /// `execute()`. External coordinators that aggregate corpus statistics
     /// across hosts inject the global scorer through `with_base_scorer`.
     base_scorer: Option<Arc<MemBM25Scorer>>,
+    /// Optional pre-resolved segment list. When set, `execute()` skips the
+    /// call to `load_segments` and uses these segments instead. Used by
+    /// external coordinators that route a query to a strict subset of the
+    /// dataset's committed segments.
+    preset_segments: Option<Vec<IndexMetadata>>,
 
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -305,6 +310,39 @@ impl MatchQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
+            preset_segments: None,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// Construct a `MatchQueryExec` bound to an explicit, pre-resolved set of
+    /// FTS segments. Unlike [`Self::new`], `execute()` will not call
+    /// [`load_segments`] — it will search exactly the segments supplied here.
+    ///
+    /// Used by distributed-FTS coordinators that route per-segment work to
+    /// specific processing elements that may host only a subset of the
+    /// dataset's committed segments.
+    pub fn try_new_with_segments(
+        dataset: Arc<Dataset>,
+        query: MatchQuery,
+        params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        segments: Vec<IndexMetadata>,
+    ) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            dataset,
+            query,
+            params,
+            prefilter_source,
+            base_scorer: None,
+            preset_segments: Some(segments),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -337,6 +375,10 @@ impl MatchQueryExec {
 
     pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
         self.base_scorer.as_ref()
+    }
+
+    pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {
+        self.preset_segments.as_deref()
     }
 }
 
@@ -383,6 +425,7 @@ impl ExecutionPlan for MatchQueryExec {
                     params: self.params.clone(),
                     prefilter_source: PreFilterSource::None,
                     base_scorer: self.base_scorer.clone(),
+                    preset_segments: self.preset_segments.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -409,6 +452,7 @@ impl ExecutionPlan for MatchQueryExec {
                     params: self.params.clone(),
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
+                    preset_segments: self.preset_segments.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -433,6 +477,7 @@ impl ExecutionPlan for MatchQueryExec {
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
+        let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -440,12 +485,15 @@ impl ExecutionPlan for MatchQueryExec {
         )))?;
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let segments = load_segments(&ds, &column)
-                .await?
-                .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
-                )))?;
+            let segments = match preset_segments {
+                Some(segments) => segments,
+                None => load_segments(&ds, &column)
+                    .await?
+                    .ok_or(DataFusionError::Execution(format!(
+                        "No Inverted index found for column {}",
+                        column,
+                    )))?,
+            };
             let _details = load_segment_details(&ds, &column, &segments).await?;
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
@@ -554,6 +602,11 @@ pub struct FlatMatchFilterExec {
     input: Arc<dyn ExecutionPlan>,
     query: MatchQuery,
     params: FtsSearchParams,
+    /// Optional pre-resolved segment list. See
+    /// [`MatchQueryExec::try_new_with_segments`]. `FlatMatchFilterExec` only
+    /// uses the first segment's tokenizer, but the full list is preserved so
+    /// the field round-trips through `with_new_children`.
+    preset_segments: Option<Vec<IndexMetadata>>,
 
     metrics: ExecutionPlanMetricsSet,
 }
@@ -601,6 +654,23 @@ impl FlatMatchFilterExec {
         Ok(default_text_tokenizer())
     }
 
+    async fn load_tokenizer_from_preset_segments(
+        dataset: &Dataset,
+        column: &str,
+        segments: &[IndexMetadata],
+        metrics: &IndexMetrics,
+    ) -> DataFusionResult<Box<dyn LanceTokenizer>> {
+        let index_meta = segments.first().ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "FTS index for column {} has no segments",
+                column
+            ))
+        })?;
+        Ok(open_fts_segment(dataset, column, index_meta, metrics)
+            .await?
+            .tokenizer())
+    }
+
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
@@ -612,8 +682,45 @@ impl FlatMatchFilterExec {
             input,
             query,
             params,
+            preset_segments: None,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// See [`MatchQueryExec::try_new_with_segments`]. `FlatMatchFilterExec`
+    /// uses the first segment's tokenizer; the rest are kept for caller-side
+    /// bookkeeping.
+    pub fn try_new_with_segments(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        query: MatchQuery,
+        params: FtsSearchParams,
+        segments: Vec<IndexMetadata>,
+    ) -> Self {
+        Self {
+            dataset,
+            input,
+            query,
+            params,
+            preset_segments: Some(segments),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    pub fn query(&self) -> &MatchQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {
+        self.preset_segments.as_deref()
     }
 
     fn find_matches<O: OffsetSizeTrait>(
@@ -634,6 +741,7 @@ impl FlatMatchFilterExec {
         input: SendableRecordBatchStream,
         dataset: Arc<Dataset>,
         query: MatchQuery,
+        preset_segments: Option<Vec<IndexMetadata>>,
         metrics: Arc<FtsIndexMetrics>,
     ) -> DataFusionResult<impl Stream<Item = DataFusionResult<RecordBatch>> + Send> {
         let column = query
@@ -643,7 +751,18 @@ impl FlatMatchFilterExec {
                 "column not set for MatchQuery {}",
                 query.terms
             )))?;
-        let mut tokenizer = Self::load_tokenizer(&dataset, column, &metrics.index_metrics).await?;
+        let mut tokenizer = match preset_segments {
+            Some(segments) => {
+                Self::load_tokenizer_from_preset_segments(
+                    &dataset,
+                    column,
+                    &segments,
+                    &metrics.index_metrics,
+                )
+                .await?
+            }
+            None => Self::load_tokenizer(&dataset, column, &metrics.index_metrics).await?,
+        };
         let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
         let column = column.clone();
 
@@ -702,6 +821,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
             input,
             query: self.query.clone(),
             params: self.params.clone(),
+            preset_segments: self.preset_segments.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
     }
@@ -713,15 +833,17 @@ impl ExecutionPlan for FlatMatchFilterExec {
         context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
+        let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
 
         let dataset = self.dataset.clone();
         let input = self.input.execute(partition, context)?;
 
-        let stream =
-            stream::once(async move { Self::do_filter(input, dataset, query, metrics).await })
-                .try_flatten()
+        let stream = stream::once(async move {
+            Self::do_filter(input, dataset, query, preset_segments, metrics).await
+        })
+        .try_flatten()
                 .map(move |batch| {
                     if let Ok(batch) = &batch {
                         metrics_clone
@@ -770,6 +892,9 @@ pub struct FlatMatchQueryExec {
     /// Optional override for the BM25 scorer normally built locally inside
     /// `execute()`. See [`MatchQueryExec::with_base_scorer`].
     base_scorer: Option<Arc<MemBM25Scorer>>,
+    /// Optional pre-resolved segment list. See
+    /// [`MatchQueryExec::try_new_with_segments`].
+    preset_segments: Option<Vec<IndexMetadata>>,
 
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
@@ -817,6 +942,33 @@ impl FlatMatchQueryExec {
             params,
             unindexed_input,
             base_scorer: None,
+            preset_segments: None,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// See [`MatchQueryExec::try_new_with_segments`].
+    pub fn try_new_with_segments(
+        dataset: Arc<Dataset>,
+        query: MatchQuery,
+        params: FtsSearchParams,
+        unindexed_input: Arc<dyn ExecutionPlan>,
+        segments: Vec<IndexMetadata>,
+    ) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            dataset,
+            query,
+            params,
+            unindexed_input,
+            base_scorer: None,
+            preset_segments: Some(segments),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -842,6 +994,10 @@ impl FlatMatchQueryExec {
 
     pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
         self.base_scorer.as_ref()
+    }
+
+    pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {
+        self.preset_segments.as_deref()
     }
 }
 
@@ -874,6 +1030,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
             params: self.params.clone(),
             unindexed_input,
             base_scorer: self.base_scorer.clone(),
+            preset_segments: self.preset_segments.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -888,6 +1045,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let preset_base_scorer = self.base_scorer.clone();
+        let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
         let target_batch_size = context.session_config().batch_size();
@@ -900,7 +1058,10 @@ impl ExecutionPlan for FlatMatchQueryExec {
             document_input(self.unindexed_input.execute(partition, context)?, &column)?;
 
         let stream = stream::once(async move {
-            let segments = load_segments(&ds, &column).await?;
+            let segments = match preset_segments {
+                Some(segments) => Some(segments),
+                None => load_segments(&ds, &column).await?,
+            };
             let (tokenizer, base_scorer) = match segments {
                 Some(segments) => {
                     let _details = load_segment_details(&ds, &column, &segments).await?;
@@ -986,6 +1147,9 @@ pub struct PhraseQueryExec {
     /// Optional override for the BM25 scorer normally built locally inside
     /// `execute()`. See [`MatchQueryExec::with_base_scorer`].
     base_scorer: Option<Arc<MemBM25Scorer>>,
+    /// Optional pre-resolved segment list. See
+    /// [`MatchQueryExec::try_new_with_segments`].
+    preset_segments: Option<Vec<IndexMetadata>>,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -1034,6 +1198,35 @@ impl PhraseQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
+            preset_segments: None,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// See [`MatchQueryExec::try_new_with_segments`].
+    pub fn try_new_with_segments(
+        dataset: Arc<Dataset>,
+        query: PhraseQuery,
+        mut params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        segments: Vec<IndexMetadata>,
+    ) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        params = params.with_phrase_slop(Some(query.slop));
+
+        Self {
+            dataset,
+            query,
+            params,
+            prefilter_source,
+            base_scorer: None,
+            preset_segments: Some(segments),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1063,6 +1256,10 @@ impl PhraseQueryExec {
 
     pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
         self.base_scorer.as_ref()
+    }
+
+    pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {
+        self.preset_segments.as_deref()
     }
 }
 
@@ -1102,6 +1299,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 params: self.params.clone(),
                 prefilter_source: PreFilterSource::None,
                 base_scorer: self.base_scorer.clone(),
+                preset_segments: self.preset_segments.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             },
@@ -1126,6 +1324,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     params: self.params.clone(),
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
+                    preset_segments: self.preset_segments.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -1150,6 +1349,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
+        let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -1157,12 +1357,15 @@ impl ExecutionPlan for PhraseQueryExec {
                 "column not set for PhraseQuery {}",
                 query.terms
             )))?;
-            let segments = load_segments(&ds, &column)
-                .await?
-                .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
-                )))?;
+            let segments = match preset_segments {
+                Some(segments) => segments,
+                None => load_segments(&ds, &column)
+                    .await?
+                    .ok_or(DataFusionError::Execution(format!(
+                        "No Inverted index found for column {}",
+                        column,
+                    )))?,
+            };
             let _details = load_segment_details(&ds, &column, &segments).await?;
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;

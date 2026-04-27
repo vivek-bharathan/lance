@@ -118,8 +118,18 @@ pub(crate) async fn build_segment(
     Ok(built_segment)
 }
 
-/// Load all committed inverted-index segments that belong to the same named index.
-pub(crate) async fn load_segments(
+/// Load all committed inverted-index segments that belong to the same named
+/// FTS index on `column`.
+///
+/// Returns `Ok(None)` if no FTS index exists on the column. When an index
+/// exists, the returned vector contains every committed segment's
+/// [`IndexMetadata`] (UUID, fragment coverage, index details). All segments
+/// must share the same indexed fields; mismatched fields return an error.
+///
+/// This is exposed publicly so that distributed-FTS coordinators (e.g. a
+/// remote query node) can enumerate segment UUIDs and route per-segment
+/// queries to the appropriate processing element.
+pub async fn load_segments(
     dataset: &Dataset,
     column: &str,
 ) -> Result<Option<Vec<IndexMetadata>>> {
@@ -152,8 +162,17 @@ pub(crate) async fn load_segments(
     Ok(Some(indices))
 }
 
-/// Load and validate the shared inverted-index details across committed segments.
-pub(crate) async fn load_segment_details(
+/// Load and validate the shared [`InvertedIndexDetails`] across committed
+/// segments returned by [`load_segments`].
+///
+/// All segments are required to agree on their decoded `InvertedIndexDetails`
+/// payload (analyzer, tokenizer, position settings, etc.); inconsistent
+/// segments return an error. Returns the canonical details that may be used
+/// when constructing a tokenizer or running a query against the index.
+///
+/// Public so that external coordinators can validate segment compatibility
+/// without re-deriving the details type from raw protobuf.
+pub async fn load_segment_details(
     dataset: &Dataset,
     column: &str,
     segments: &[IndexMetadata],
