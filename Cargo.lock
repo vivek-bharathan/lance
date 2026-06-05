@@ -4614,6 +4614,7 @@ dependencies = [
  "proptest",
  "prost",
  "rand 0.9.4",
+ "rand_distr",
  "roaring",
  "rstest",
  "serde_json",

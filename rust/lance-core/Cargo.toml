@@ -49,6 +49,7 @@ libc = { version = "0.2" }
 
 [dev-dependencies]
 proptest.workspace = true
+rand_distr.workspace = true
 rstest.workspace = true
 
 [features]
