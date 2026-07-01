@@ -274,6 +274,10 @@ pub struct VectorIndexParams {
     /// Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters").
     /// Populated by the build path and merged into VectorIndexDetails at creation time.
     pub runtime_hints: HashMap<String, String>,
+
+    /// Columns to co-locate ("include") in the index storage alongside the row id
+    /// and the quantization code. Empty by default.
+    pub include_columns: Vec<String>,
 }
 
 impl VectorIndexParams {
@@ -287,6 +291,12 @@ impl VectorIndexParams {
         self
     }
 
+    /// Set the columns to co-locate ("include") in the index storage.
+    pub fn include_columns(&mut self, columns: Vec<String>) -> &mut Self {
+        self.include_columns = columns;
+        self
+    }
+
     pub fn ivf_flat(num_partitions: usize, metric_type: MetricType) -> Self {
         let ivf_params = IvfBuildParams::new(num_partitions);
         let stages = vec![StageParams::Ivf(ivf_params)];
@@ -296,6 +306,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -307,6 +318,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -342,6 +354,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -369,6 +382,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -385,6 +399,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -400,6 +415,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -415,6 +431,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -430,6 +447,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -452,6 +470,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -474,6 +493,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -957,6 +977,23 @@ pub(crate) async fn build_vector_index(
     .await?;
     let stages = &params.stages;
 
+    // Covering ("included") columns are only implemented for IVF_PQ with the V3
+    // file format: only ProductQuantizationStorage preserves and reports them.
+    // Reject everything else up front -- otherwise the build silently ignores
+    // the option while `included_fields` still lands in the index metadata, and
+    // the search exec then declares a covered schema the storage cannot emit.
+    if !params.include_columns.is_empty() {
+        let supported =
+            index_type == IndexType::IvfPq && matches!(params.version, IndexFileVersion::V3);
+        if !supported {
+            return Err(Error::invalid_input(format!(
+                "include_columns (covering columns) is only supported for IVF_PQ indexes \
+                 with index file version V3, but got index type {} with version {:?}",
+                index_type, params.version
+            )));
+        }
+    }
+
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
@@ -1038,6 +1075,7 @@ pub(crate) async fn build_vector_index(
                     )?;
 
                     let summary = builder
+                        .with_include_columns(params.include_columns.clone())
                         .with_transpose(!params.skip_transpose)
                         .with_progress(progress.clone())
                         .build()
@@ -1276,6 +1314,22 @@ pub(crate) async fn build_vector_index_incremental(
     // Determine the index type and build incrementally
     let (sub_index_type, quantization_type) = existing_index.sub_index_type();
 
+    // Same restriction as `build_vector_index`: covering columns are only
+    // implemented for IVF_PQ storage.
+    if !params.include_columns.is_empty() {
+        let supported = matches!(
+            (&sub_index_type, &quantization_type),
+            (SubIndexType::Flat, QuantizationType::Product)
+        );
+        if !supported {
+            return Err(Error::invalid_input(format!(
+                "include_columns (covering columns) is only supported for IVF_PQ indexes, \
+                 but got {}_{}",
+                sub_index_type, quantization_type
+            )));
+        }
+    }
+
     match (sub_index_type, quantization_type) {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
@@ -1330,6 +1384,7 @@ pub(crate) async fn build_vector_index_incremental(
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
+                .with_include_columns(params.include_columns.clone())
                 .with_progress(progress.clone())
                 .build()
                 .await?;
@@ -1785,7 +1840,7 @@ pub async fn initialize_vector_index(
     let (sub_index_type, quantization_type) = source_vector_index.sub_index_type();
     let ivf_params = derive_ivf_params(ivf_model);
 
-    let params = match (sub_index_type, quantization_type) {
+    let mut params = match (sub_index_type, quantization_type) {
         (SubIndexType::Flat, QuantizationType::Flat)
         | (SubIndexType::Flat, QuantizationType::FlatBin) => {
             VectorIndexParams::with_ivf_flat_params(metric_type, ivf_params)
@@ -1840,6 +1895,21 @@ pub async fn initialize_vector_index(
         }
     };
 
+    // Carry the source index's covering ("included") columns so the rebuilt
+    // target storage keeps them. included_fields are field ids in the source;
+    // resolve to names (the same columns must exist in the target dataset).
+    let included_columns: Vec<String> = source_index
+        .included_fields
+        .iter()
+        .filter_map(|id| {
+            source_dataset
+                .schema()
+                .field_by_id(*id)
+                .map(|f| f.name.clone())
+        })
+        .collect();
+    params.include_columns(included_columns);
+
     let new_uuid = Uuid::new_v4();
     let frag_reuse_index = target_dataset
         .open_frag_reuse_index(&NoOpMetricsCollector)
@@ -1865,6 +1935,25 @@ pub async fn initialize_vector_index(
 
     let fragment_bitmap = Some(target_dataset.fragment_bitmap.as_ref().clone());
 
+    // Field ids are per-dataset: re-resolve the covering column names against
+    // the TARGET schema (like `fields` below), never copy the source's ids.
+    let included_fields = params
+        .include_columns
+        .iter()
+        .map(|name| {
+            target_dataset
+                .schema()
+                .field(name)
+                .map(|f| f.id)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "covering column '{}' not found in target dataset schema",
+                        name
+                    ))
+                })
+        })
+        .collect::<Result<Vec<i32>>>()?;
+
     let new_idx = IndexMetadata {
         uuid: new_uuid,
         name: source_index.name.clone(),
@@ -1876,6 +1965,7 @@ pub async fn initialize_vector_index(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(summary.files),
+        included_fields,
     };
 
     let transaction = Transaction::new(
@@ -2335,6 +2425,142 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 10, "Should return 10 nearest neighbors");
+    }
+
+    /// `include_columns` is only implemented for IVF_PQ (V3). Any other index
+    /// type must be rejected at create time: the build would silently ignore
+    /// the option while `create_index` still records `included_fields` in the
+    /// manifest, so the exec would declare a covered schema the storage cannot
+    /// emit and every query on the index would fail.
+    #[tokio::test]
+    async fn test_include_columns_rejected_for_unsupported_index_types() {
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        for (label, mut params) in [
+            ("IVF_FLAT", VectorIndexParams::ivf_flat(4, MetricType::L2)),
+            (
+                "IVF_PQ legacy",
+                VectorIndexParams::with_ivf_pq_params(
+                    MetricType::L2,
+                    IvfBuildParams::new(4),
+                    PQBuildParams::new(8, 8),
+                )
+                .version(IndexFileVersion::Legacy)
+                .clone(),
+            ),
+        ] {
+            params.include_columns(vec!["id".to_string()]);
+            let err = dataset
+                .create_index(&["vector"], IndexType::Vector, None, &params, true)
+                .await
+                .expect_err(&format!("include_columns on {label} must be rejected"));
+            assert!(
+                err.to_string().contains("include_columns"),
+                "{label}: error should name include_columns, got: {err}"
+            );
+            // Fail fast: no index metadata must have been committed.
+            assert!(
+                dataset.load_indices().await.unwrap().is_empty(),
+                "{label}: no index should have been created"
+            );
+        }
+    }
+
+    /// Copying/importing a covered index into another dataset (initialize) must
+    /// rebuild the target storage WITH the covering columns, not just copy the
+    /// `included_fields` metadata -- otherwise the target advertises covering
+    /// columns its storage can't emit and covered queries fail.
+    #[tokio::test]
+    async fn test_initialize_vector_index_preserves_covering() {
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
+
+        let source_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+
+        // Covered IVF_PQ index on source (covers `id`).
+        let mut params = VectorIndexParams::ivf_pq(10, 8, 16, MetricType::L2, 50);
+        params.include_columns(vec!["id".to_string()]);
+        source_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vidx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+        let source_index = source_dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|i| i.name == "vidx")
+            .unwrap()
+            .clone();
+
+        // The target has an extra leading column, so its field ids are shifted
+        // relative to the source's: `included_fields` must be re-resolved
+        // against the TARGET schema (by name), not copied from the source.
+        let target_reader = lance_datagen::gen_batch()
+            .col("pad", array::step::<Int32Type>())
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+
+        initialize_vector_index(
+            &mut target_dataset,
+            &source_dataset,
+            &source_index,
+            &["vector"],
+        )
+        .await
+        .unwrap();
+
+        // Metadata carried over, resolved to the target's field ids.
+        let target_index = target_dataset.load_indices().await.unwrap()[0].clone();
+        let id_field = target_dataset.schema().field("id").unwrap().id;
+        assert_ne!(
+            id_field, source_index.included_fields[0],
+            "test setup must give 'id' different field ids in source and target"
+        );
+        assert_eq!(target_index.included_fields, vec![id_field]);
+
+        // End-to-end: a covered projection on the copied index skips the take and
+        // returns `id` -- which only works if the rebuilt storage carries it.
+        let query = arrow_array::Float32Array::from(vec![0.5f32; 32]);
+        let mut scan = target_dataset.scan();
+        scan.nearest("vector", &query, 10).unwrap();
+        scan.project(&["id"]).unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(
+            !plan.contains("Take"),
+            "covered projection should skip the take on the copied index; plan:\n{plan}"
+        );
+        let batch = scan.try_into_batch().await.unwrap();
+        assert!(
+            batch.column_by_name("id").is_some(),
+            "copied index should emit the covering column 'id'"
+        );
     }
 
     #[tokio::test]

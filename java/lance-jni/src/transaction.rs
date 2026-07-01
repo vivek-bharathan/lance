@@ -215,6 +215,9 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             created_at,
             base_id,
             files: None,
+            // Covering columns are not yet round-tripped through the Java
+            // transaction binding; default to none.
+            included_fields: Vec::new(),
         })
     }
 }

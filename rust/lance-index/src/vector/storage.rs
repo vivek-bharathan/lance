@@ -409,6 +409,37 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     /// The storage implement will perform quantization if necessary.
     fn append_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self>;
 
+    /// Field indices of the "included"/covering columns: the extra columns
+    /// stored alongside the row id and quantization code so a covered query can
+    /// skip the take from the base table.
+    ///
+    /// The default is empty (no covering). A storage that supports covering must
+    /// override this, since only it knows which of its columns are quantization
+    /// code columns versus included columns — inferring that generically by name
+    /// is unsafe (e.g. it would mistake RaBitQ's code columns for covering ones).
+    fn covering_field_indices(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// `[_rowid, <included cols...>]` for the whole storage. Captured while a
+    /// partition is loaded during search so covering columns can be emitted with
+    /// the result without a separate take. Returns `None` if there are no
+    /// included columns (ordinary index — nothing to cover).
+    fn covering_batch(&self) -> Result<Option<RecordBatch>> {
+        let included = self.covering_field_indices();
+        if included.is_empty() {
+            return Ok(None);
+        }
+        let schema = self.schema().clone();
+        let row_id_idx = schema.index_of(ROW_ID)?;
+        let mut indices = Vec::with_capacity(included.len() + 1);
+        indices.push(row_id_idx);
+        indices.extend(included);
+        let batches: Vec<RecordBatch> = self.to_batches()?.collect();
+        let combined = concat_batches(&schema, batches.iter())?;
+        Ok(Some(combined.project(&indices)?))
+    }
+
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
     /// Using dist calculator can be more efficient as it can pre-compute some
@@ -467,7 +498,54 @@ impl<Q: Quantization> StorageBuilder<Q> {
     }
 
     pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
-        let mut batch = concat_batches(batches[0].schema_ref(), batches.iter())?;
+        // Batches can come from different sources (existing partitions loaded
+        // from disk vs freshly shuffled/split/reassigned data) that carry the
+        // same columns in a different order -- notably when the index has
+        // included/covering columns. `concat_batches` matches columns by
+        // position, so align every batch to the first batch's column order (by
+        // name). No-op when all batches already share a schema.
+        let schema = batches[0].schema();
+        let aligned: Vec<RecordBatch> = batches
+            .iter()
+            .map(|b| {
+                if b.schema() == schema {
+                    return Ok(b.clone());
+                }
+                // Same column count + every expected column present = same set.
+                // A batch with MORE columns must error too: aligning it to the
+                // first batch's schema would silently drop the extras (e.g.
+                // covering columns the index metadata still advertises).
+                if b.num_columns() != schema.fields().len() {
+                    let names = |s: &arrow_schema::Schema| {
+                        s.fields()
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    return Err(Error::index(format!(
+                        "mismatched columns while merging vector storage batches: \
+                         expected [{}], got [{}]",
+                        names(&schema),
+                        names(&b.schema()),
+                    )));
+                }
+                let columns = schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        b.column_by_name(f.name()).cloned().ok_or_else(|| {
+                            Error::index(format!(
+                                "column '{}' missing while merging vector storage batches",
+                                f.name()
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(RecordBatch::try_new(schema.clone(), columns)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut batch = concat_batches(&schema, aligned.iter())?;
 
         if batch.column_by_name(self.quantizer.column()).is_none() {
             let vectors = batch
@@ -618,6 +696,22 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     pub fn schema(&self) -> SchemaRef {
         Arc::new(self.reader.schema().as_ref().into())
+    }
+
+    /// The `[_rowid, <included cols...>]` schema for this index's covering
+    /// columns, or `None` if the index has no covering columns. Derived from an
+    /// empty storage instance (no I/O) so callers can emit the correct covered
+    /// output schema even when zero partitions are searched.
+    pub fn covering_schema(&self) -> Result<Option<SchemaRef>> {
+        let arrow_schema = arrow_schema::Schema::from(self.reader.schema().as_ref());
+        let empty = RecordBatch::new_empty(Arc::new(arrow_schema));
+        let storage = Q::Storage::try_from_batch(
+            empty,
+            self.metadata(),
+            self.distance_type,
+            self.frag_reuse_index.clone(),
+        )?;
+        Ok(storage.covering_batch()?.map(|b| b.schema()))
     }
 
     /// Get the number of partitions in the storage.

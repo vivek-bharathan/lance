@@ -725,6 +725,7 @@ impl MemTableFlusher {
                 created_at: None,
                 base_id: None,
                 files: None,
+                included_fields: Vec::new(),
             };
             created_indexes.push(index_meta);
 
@@ -1049,6 +1050,7 @@ impl MemTableFlusher {
             created_at: Some(chrono::Utc::now()),
             index_version: 1,
             files: None,
+            included_fields: Vec::new(),
         };
 
         Ok(Some(index_meta))

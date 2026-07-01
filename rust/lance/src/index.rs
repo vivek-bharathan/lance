@@ -178,6 +178,7 @@ pub(crate) async fn build_index_metadata_from_segments(
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: None,
+                included_fields: Vec::new(),
             };
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
@@ -198,6 +199,7 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(files),
+            included_fields: Vec::new(),
         });
     }
 
@@ -1667,6 +1669,9 @@ impl DatasetIndexExt for Dataset {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None, // New merged index file locates in the cloned dataset.
                 files: Some(res.files),
+                // Covering columns are unchanged by a merge; the merged storage
+                // still carries them, so keep declaring them.
+                included_fields: last_idx.included_fields.clone(),
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             new_indices.push(new_idx);
@@ -2945,6 +2950,7 @@ mod tests {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
             }]),
+            included_fields: Vec::new(),
         }
     }
 
@@ -4834,6 +4840,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -4874,6 +4881,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -7072,6 +7080,7 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: seg0.files.clone(),
+            included_fields: Vec::new(),
         };
 
         let err = dataset

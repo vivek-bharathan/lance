@@ -2292,6 +2292,7 @@ mod tests {
             created_at: None, // Test index, not setting timestamp
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -2794,6 +2795,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
         let index1 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -2860,6 +2862,7 @@ mod tests {
                         created_at: None,
                         base_id: None,
                         files: None,
+                        included_fields: Vec::new(),
                     }],
                     removed_indices: vec![],
                 },

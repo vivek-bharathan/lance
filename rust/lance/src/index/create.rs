@@ -466,6 +466,20 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         };
 
+        // Resolve any covering ("included") columns to field ids for the generic
+        // IndexMetadata. The build path has already validated these names exist in the schema.
+        let included_fields = self
+            .params
+            .as_any()
+            .downcast_ref::<VectorIndexParams>()
+            .map(|vp| {
+                vp.include_columns
+                    .iter()
+                    .filter_map(|name| self.dataset.schema().field(name).map(|f| f.id))
+                    .collect::<Vec<i32>>()
+            })
+            .unwrap_or_default();
+
         Ok(IndexMetadata {
             uuid: output_index_uuid,
             name: index_name,
@@ -485,6 +499,7 @@ impl<'a> CreateIndexBuilder<'a> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(created_index.files),
+            included_fields,
         })
         }
         .boxed()
@@ -652,6 +667,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(created_index.files),
+                included_fields: Vec::new(),
             };
             let segments = vec![metadata.into_index_segment()?];
             let new_indices =
@@ -721,6 +737,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(created_index.files),
+                included_fields: Vec::new(),
             });
         }
 

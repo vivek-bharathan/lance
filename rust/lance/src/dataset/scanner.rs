@@ -4009,6 +4009,22 @@ impl Scanner {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 columns.extend(filter_columns);
             }
+            // Include the index's covering ("included") columns so the flat search
+            // over unindexed fragments produces the same schema as the index
+            // search (which now emits covering columns) before they are unioned.
+            // Without this, projecting `topk_appended` to `knn_node.schema()`
+            // below panics on the missing covering column.
+            for id in indexed_segments
+                .first()
+                .map(|s| s.included_fields.as_slice())
+                .unwrap_or(&[])
+            {
+                if let Some(field) = self.dataset.schema().field_by_id(*id)
+                    && !columns.contains(&field.name)
+                {
+                    columns.push(field.name.clone());
+                }
+            }
             let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
             // Note: we could try and use the scalar indices here to reduce the scope of this scan but the
             // most common case is that fragments that are newer than the vector index are going to be newer
@@ -11792,6 +11808,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     version: crate::index::vector::IndexFileVersion::Legacy,
                     skip_transpose: false,
                     runtime_hints: Default::default(),
+                    include_columns: Vec::new(),
                 },
                 false,
             )

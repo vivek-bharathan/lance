@@ -104,6 +104,9 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             created_at,
             base_id,
             files,
+            // Covering columns are not yet round-tripped through the Python
+            // transaction binding; default to none.
+            included_fields: Vec::new(),
         }))
     }
 }

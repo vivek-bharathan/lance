@@ -1386,6 +1386,10 @@ pub struct ANNIvfSubIndexExec {
     /// Prefiltering input
     prefilter_source: PreFilterSource,
 
+    /// Output schema: `[_distance, _rowid]` plus any included/covering columns
+    /// the index emits.
+    output_schema: SchemaRef,
+
     /// Datafusion Plan Properties
     properties: Arc<PlanProperties>,
 
@@ -1406,8 +1410,30 @@ impl ANNIvfSubIndexExec {
                 PART_ID_COLUMN
             )));
         }
+        // Declare any included/covering columns recorded in the index manifest
+        // (`IndexMetadata.included_fields`, by field id); the per-partition search
+        // emits them so a covered projection lets TakeExec skip the base-table
+        // fetch. Empty for ordinary indexes. Resolve id -> name -> arrow field so
+        // the declared schema matches the columns stored at build time exactly.
+        let mut fields = KNN_INDEX_SCHEMA.fields().to_vec();
+        let included_ids = indices
+            .first()
+            .map(|idx| idx.included_fields.clone())
+            .unwrap_or_default();
+        if !included_ids.is_empty() {
+            let lance_schema = dataset.schema();
+            let ds_schema = arrow_schema::Schema::from(lance_schema);
+            for id in &included_ids {
+                if let Some(lance_field) = lance_schema.field_by_id(*id)
+                    && let Ok(field) = ds_schema.field_with_name(&lance_field.name)
+                {
+                    fields.push(Arc::new(field.clone()));
+                }
+            }
+        }
+        let output_schema = Arc::new(arrow_schema::Schema::new(fields));
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
+            EquivalenceProperties::new(output_schema.clone()),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
@@ -1418,6 +1444,7 @@ impl ANNIvfSubIndexExec {
             indices,
             query,
             prefilter_source,
+            output_schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -1624,6 +1651,7 @@ impl ANNIvfSubIndexExec {
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
         target_partitions: usize,
+        has_covered: bool,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
             let max_nprobes = query
@@ -1648,9 +1676,18 @@ impl ANNIvfSubIndexExec {
 
             let max_results = prefilter_mask.max_len().map(|x| x as usize);
 
+            // A selective bounded prefilter: fewer than k rows match and we
+            // haven't found them all yet. Drives the non-covered shortcut below
+            // and the covered re-rank further down.
+            let selective = max_results.is_some_and(|m| found_so_far < m && m <= query.k);
+
             if let Some(max_results) = max_results
                 && found_so_far < max_results
                 && max_results <= query.k
+                // The shortcut emits only [_distance, _rowid]; for a covering
+                // index that would drop the covering columns the exec declares.
+                // Fall through to the full search, which emits them (batch path).
+                && !has_covered
             {
                 // In this case there are fewer than k results matching the prefilter so
                 // just return the prefilter ids and don't bother searching any further
@@ -1690,6 +1727,28 @@ impl ANNIvfSubIndexExec {
             // Stop searching if we have k results or we've found all the results
             // that could possible match the prefilter
             let max_results = max_results.unwrap_or(usize::MAX).min(query.k);
+
+            // A covered index disables the not-found shortcut above, so to keep
+            // row-count parity with the non-covered path (which returns ALL
+            // prefilter matches) a selective prefilter must be able to reach
+            // matches in partitions beyond `maximum_nprobes`. Re-rank over all
+            // partitions and let the full search find them, with real distances
+            // and covering columns; `should_stop` still caps work at
+            // `max_results`, so only the (few) matching partitions are scored.
+            let (partitions, q_c_dists, max_nprobes) =
+                if has_covered && selective && query.maximum_nprobes.is_some() {
+                    let mut refind_query = query.clone();
+                    refind_query.maximum_nprobes = None;
+                    match index.find_partitions(&refind_query) {
+                        Ok((all_parts, all_dists)) if all_parts.len() > max_nprobes => {
+                            let n = all_parts.len();
+                            (Arc::new(all_parts), Arc::new(all_dists), n)
+                        }
+                        _ => (partitions, q_c_dists, max_nprobes),
+                    }
+                } else {
+                    (partitions, q_c_dists, max_nprobes)
+                };
 
             let state_clone = state.clone();
 
@@ -1848,7 +1907,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        KNN_INDEX_SCHEMA.clone()
+        self.output_schema.clone()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1893,6 +1952,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 indices: self.indices.clone(),
                 query: self.query.clone(),
                 prefilter_source,
+                output_schema: self.output_schema.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             }
@@ -1911,6 +1971,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context.clone())?;
         let schema = self.schema();
+        // When the index emits covering columns, the output schema is wider than
+        // [_distance, _rowid]; the late-search no-rows shortcut emits only those
+        // two columns, so disable it here and let the full search emit covering.
+        let has_covered = schema.fields().len() > KNN_INDEX_SCHEMA.fields().len();
         let target_partitions = context.session_config().target_partitions();
         let query = self.query.clone();
         let ds = self.dataset.clone();
@@ -2018,6 +2082,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             metrics,
                             state,
                             target_partitions,
+                            has_covered,
                         );
                         DataFusionResult::Ok(early_search.chain(late_search).boxed())
                     }
@@ -2568,7 +2633,12 @@ mod tests {
         }
 
         fn find_partitions(&self, _query: &Query) -> Result<(UInt32Array, Float32Array)> {
-            unimplemented!()
+            // No additional partitions to reveal; the covered re-rank in
+            // late_search treats an empty result as "nothing more to search".
+            Ok((
+                UInt32Array::from(Vec::<u32>::new()),
+                Float32Array::from(Vec::<f32>::new()),
+            ))
         }
 
         fn total_partitions(&self) -> usize {
@@ -2818,8 +2888,72 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
         let prefilter = Arc::new(DatasetPreFilter::new(dataset, &[index], None));
+        prefilter.wait_for_ready().await.unwrap();
+        prefilter
+    }
+
+    /// A `FilterLoader` that yields a fixed allow-list of row addresses, so the
+    /// resulting prefilter mask is a bounded `AllowList` (`max_len()` is `Some`).
+    struct StaticAllowList(Vec<u64>);
+
+    #[async_trait]
+    impl FilterLoader for StaticAllowList {
+        async fn load(self: Box<Self>) -> lance_core::Result<lance_select::RowAddrMask> {
+            Ok(lance_select::RowAddrMask::from_allowed(
+                lance_select::RowAddrTreeMap::from_iter(self.0.iter().copied()),
+            ))
+        }
+    }
+
+    /// Like `empty_prefilter`, but the prefilter mask is a bounded allow-list of
+    /// the given row addresses, which drives the late-search no-rows shortcut.
+    async fn bounded_prefilter(allow: Vec<u64>) -> Arc<DatasetPreFilter> {
+        static NEXT_PREFILTER_DATASET_ID: AtomicUsize = AtomicUsize::new(100_000);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let uri = format!(
+            "memory://bounded-prefilter-{}",
+            NEXT_PREFILTER_DATASET_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+                &uri,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let mut indexed_fragments = RoaringBitmap::new();
+        for fragment in dataset.manifest.fragments.iter() {
+            indexed_fragments.insert(fragment.id as u32);
+        }
+        let index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![],
+            name: "test".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: Some(indexed_fragments),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            included_fields: Vec::new(),
+        };
+        let loader: Box<dyn FilterLoader> = Box::new(StaticAllowList(allow));
+        let prefilter = Arc::new(DatasetPreFilter::new(dataset, &[index], Some(loader)));
         prefilter.wait_for_ready().await.unwrap();
         prefilter
     }
@@ -3026,6 +3160,7 @@ mod tests {
             prepared_metrics(),
             state.clone(),
             usize::MAX,
+            false,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -3035,6 +3170,61 @@ mod tests {
         assert_eq!(*prepared_partitions.lock().unwrap(), vec![0, 1, 2]);
         assert_eq!(*searched_partitions.lock().unwrap(), vec![0]);
         assert_eq!(state.num_results_found.load(Ordering::Relaxed), 2);
+    }
+
+    /// The late-search no-rows shortcut emits only `[_distance, _rowid]`, which
+    /// would drop a covering index's included columns. With `has_covered`, the
+    /// shortcut must be bypassed so the full search emits them. Control case
+    /// (`has_covered=false`) proves the setup actually reaches the shortcut.
+    #[tokio::test]
+    async fn test_late_search_covered_bypasses_no_rows_shortcut() {
+        // Bounded prefilter (one allowed row) + k=2 => max_results=1 <= k, and an
+        // empty initial state => found_so_far=0 < max_results: shortcut criteria.
+        async fn run_late_search(has_covered: bool) -> (Vec<RecordBatch>, Vec<usize>) {
+            let (index, _prepared, searched_partitions, _threads) =
+                prepared_index(vec![21, 22, 23]);
+            let mut query = base_query();
+            query.k = 2;
+            query.minimum_nprobes = 0;
+            query.maximum_nprobes = Some(3);
+            let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
+
+            let batches = ANNIvfSubIndexExec::late_search(
+                index,
+                query,
+                Arc::new(UInt32Array::from(vec![0, 1, 2])),
+                Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3])),
+                bounded_prefilter(vec![0]).await,
+                prepared_metrics(),
+                state,
+                usize::MAX,
+                has_covered,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+            let searched = searched_partitions.lock().unwrap().clone();
+            (batches, searched)
+        }
+
+        // Control: a non-covered index takes the shortcut, so no partition is
+        // searched and the only batch is the [_distance, _rowid] not-found batch.
+        let (batches, searched) = run_late_search(false).await;
+        assert!(
+            searched.is_empty(),
+            "non-covered query should take the shortcut and skip the search, searched={searched:?}"
+        );
+        assert!(
+            batches.iter().all(|b| b.num_columns() == 2),
+            "the shortcut emits only [_distance, _rowid]"
+        );
+
+        // Covered: the shortcut is bypassed and the full search runs.
+        let (_batches, searched) = run_late_search(true).await;
+        assert!(
+            !searched.is_empty(),
+            "covered query must bypass the shortcut and run the full search"
+        );
     }
 
     #[tokio::test]

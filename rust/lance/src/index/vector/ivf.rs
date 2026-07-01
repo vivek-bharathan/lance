@@ -395,6 +395,9 @@ pub(crate) async fn optimize_vector_indices(
     vector_column: &str,
     logical_index: &LogicalIvfView<'_>,
     options: &OptimizeOptions,
+    // Covering ("included") column names to preserve through the merge. Empty
+    // for ordinary indexes. Only the v2 path supports covering columns.
+    included_columns: &[String],
 ) -> Result<(Uuid, usize, Vec<IndexFile>)> {
     let existing_indices = logical_index.indices().cloned().collect::<Vec<_>>();
     // Sanity check the indices
@@ -413,6 +416,7 @@ pub(crate) async fn optimize_vector_indices(
             vector_column,
             &existing_indices,
             options,
+            included_columns,
         )
         .await;
     }
@@ -485,6 +489,9 @@ pub(crate) async fn optimize_vector_indices_v2(
     vector_column: &str,
     existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
+    // Covering ("included") column names to preserve through the merge/split/join.
+    // Empty for ordinary indexes.
+    included_columns: &[String],
 ) -> Result<(Uuid, usize, Vec<IndexFile>)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
@@ -567,6 +574,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_include_columns(included_columns.to_vec())
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -587,6 +595,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_include_columns(included_columns.to_vec())
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -607,6 +616,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_include_columns(included_columns.to_vec())
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -626,6 +636,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_include_columns(included_columns.to_vec())
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -686,6 +697,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_include_columns(included_columns.to_vec())
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -706,6 +718,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_include_columns(included_columns.to_vec())
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -5077,6 +5090,7 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         // We need to commit this index to the dataset so that it can be found
@@ -5116,6 +5130,7 @@ mod tests {
             created_at: None, // Test index, not setting timestamp
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -5175,6 +5190,7 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         // We need to commit this new index to the dataset so it can be found

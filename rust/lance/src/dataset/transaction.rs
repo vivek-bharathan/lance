@@ -2598,7 +2598,10 @@ impl Transaction {
     }
 
     /// If an operation modifies one or more fields in a fragment then we need to remove
-    /// that fragment from any indices that cover one of the modified fields.
+    /// that fragment from any indices that cover one of the modified fields — whether as
+    /// an indexed key field (`fields`) or as a covering/"included" field
+    /// (`included_fields`, whose values are materialized in the index storage and would
+    /// otherwise be served stale).
     fn prune_updated_fields_from_indices(
         indices: &mut [IndexMetadata],
         updated_fragments: &[Fragment],
@@ -2615,6 +2618,7 @@ impl Transaction {
             if index
                 .fields
                 .iter()
+                .chain(index.included_fields.iter())
                 .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
                 && let Some(fragment_bitmap) = &mut index.fragment_bitmap
             {
@@ -3928,6 +3932,7 @@ mod tests {
             created_at: Some(Utc::now()),
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         }
     }
 
@@ -4435,6 +4440,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         }
     }
 
@@ -4457,6 +4463,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         }
     }
 

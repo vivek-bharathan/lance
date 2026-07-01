@@ -10650,6 +10650,181 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         );
     }
 
+    // Regression test: a partial-schema merge_insert that rewrites a column stored in a
+    // vector index as a covering ("included") column must drop the affected fragments from
+    // that index's bitmap. Covering values are materialized in the index storage, so a
+    // fragment left in the bitmap would keep serving the old values from the index while
+    // the data files hold the new ones.
+    #[tokio::test]
+    async fn test_partial_merge_insert_prunes_covering_column_index() {
+        let dim = 4i32;
+        // Enough rows for PQ training (8 bits -> 256 centroids per sub-vector).
+        let rows_per_frag = 256usize;
+        let num_frags = 3usize;
+        let total_rows = rows_per_frag * num_frags;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                false,
+            ),
+        ]));
+
+        let make_batch = |frag_idx: usize| {
+            let start = frag_idx * rows_per_frag;
+            let ids: Vec<String> = (start..start + rows_per_frag)
+                .map(|j| format!("id-{j:04}"))
+                .collect();
+            let cats: Vec<String> = (start..start + rows_per_frag)
+                .map(|j| format!("cat-{j:04}"))
+                .collect();
+            let values: Vec<f32> = (0..rows_per_frag * dim as usize)
+                .map(|i| (start * dim as usize + i) as f32)
+                .collect();
+            let vectors =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(StringArray::from(cats)),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap()
+        };
+
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(make_batch(0))],
+            schema.clone(),
+        ));
+        let mut ds = Dataset::write(reader, "memory://covering_prune_test", None)
+            .await
+            .unwrap();
+        for frag_idx in 1..num_frags {
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(make_batch(frag_idx))],
+                schema.clone(),
+            ));
+            ds.append(reader, None).await.unwrap();
+        }
+
+        // Scalar index on the join key so the merge takes the indexed-scan path,
+        // which patches columns in place (RewriteColumns) instead of rewriting
+        // whole rows into new fragments. Only that path leaves updated rows
+        // inside indexed fragments, where a stale covering value could be served.
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // IVF_PQ index on vec with `category` as a covering (included) column.
+        let mut params = VectorIndexParams::ivf_pq(1, 8, 2, MetricType::L2, 2);
+        params.include_columns(vec!["category".to_string()]);
+        ds.create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // The covering column must be recorded on the index metadata; the prune
+        // logic below keys on it.
+        let category_field_id = ds.schema().field("category").unwrap().id;
+        let indices = ds.load_indices().await.unwrap();
+        let vec_idx = indices.iter().find(|i| i.name == "vec_idx").unwrap();
+        assert_eq!(vec_idx.included_fields, vec![category_field_id]);
+
+        let ds = Arc::new(ds);
+
+        // Partial merge_insert rewriting ONLY `category` (not the indexed vector
+        // column) for fragment 1's rows.
+        let frag1_start = rows_per_frag;
+        let ids: Vec<String> = (frag1_start..frag1_start + rows_per_frag)
+            .map(|j| format!("id-{j:04}"))
+            .collect();
+        let new_cats: Vec<String> = (frag1_start..frag1_start + rows_per_frag)
+            .map(|j| format!("updated-{j:04}"))
+            .collect();
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(new_cats)),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update_batch)], sub_schema));
+        let (ds, _) = MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
+
+        // The rewritten fragment must leave the index bitmap even though `category`
+        // is only a covering column of the index, not its indexed key column.
+        let indices = ds.load_indices().await.unwrap();
+        let vec_idx = indices.iter().find(|i| i.name == "vec_idx").unwrap();
+        let bitmap = vec_idx.fragment_bitmap.as_ref().unwrap();
+        assert!(
+            !bitmap.contains(1),
+            "fragment 1 should be pruned from the index bitmap after its covering \
+             column was rewritten, got {:?}",
+            bitmap
+        );
+
+        // And a covered query must observe the fresh values: fragment 1 rows now come
+        // from the flat-search path (data files), the rest from the index storage.
+        let query: Float32Array = (0..dim)
+            .map(|i| (frag1_start * dim as usize + i as usize) as f32)
+            .collect();
+        let results = ds
+            .scan()
+            .nearest("vec", &query, total_rows)
+            .unwrap()
+            .project(&["id", "category"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), total_rows);
+        let ids = results
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let cats = results
+            .column_by_name("category")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..ids.len() {
+            let id = ids.value(i);
+            let n: usize = id[3..].parse().unwrap();
+            let expected = if (frag1_start..frag1_start + rows_per_frag).contains(&n) {
+                format!("updated-{n:04}")
+            } else {
+                format!("cat-{n:04}")
+            };
+            assert_eq!(cats.value(i), expected, "stale covering value for row {id}");
+        }
+    }
+
     // Regression test: after a partial-schema merge_insert drops a fragment from the FTS
     // index bitmap, a full text search should not return duplicate rows. The stale inverted
     // index data still references the dropped fragment, and the scanner also flat-scans

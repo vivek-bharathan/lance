@@ -1280,6 +1280,7 @@ impl ManifestNamespace {
             created_at: None,
             base_id: None,
             files: Some(trained_index.created_index.files),
+            included_fields: Vec::new(),
         })
     }
 

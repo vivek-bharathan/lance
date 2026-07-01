@@ -538,6 +538,7 @@ async fn do_load_shuffled_vectors(
         created_at: Some(Utc::now()),
         base_id: None,
         files: Some(files),
+        included_fields: Vec::new(),
     };
     let segment = IndexSegment::new(
         metadata.uuid,

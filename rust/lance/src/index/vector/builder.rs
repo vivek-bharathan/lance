@@ -101,6 +101,43 @@ const SPLIT_SAMPLE_SIZE: usize = 512;
 ///
 /// Unchanged centroids keep their original indices.  The k-th split's second
 /// centroid lands at index `original.len() + k`.
+/// Append the covering columns from `covering` (`[_rowid, <included cols...>]`)
+/// onto `batch` (which must contain a `_rowid` column), gathered by row id.
+/// Used to re-attach covering columns to rows that were reordered/regrouped by
+/// the partition-join reassignment.
+fn append_covering_by_row_id(
+    mut batch: RecordBatch,
+    covering: &RecordBatch,
+) -> Result<RecordBatch> {
+    let target_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+    let src_ids = covering[ROW_ID].as_primitive::<UInt64Type>();
+    let mut pos: HashMap<u64, u32> = HashMap::with_capacity(src_ids.len());
+    for (i, id) in src_ids.values().iter().enumerate() {
+        pos.insert(*id, i as u32);
+    }
+    let take_idx: UInt32Array = target_ids
+        .values()
+        .iter()
+        .map(|id| {
+            pos.get(id).copied().ok_or_else(|| {
+                Error::index(format!(
+                    "row id {id} missing from covering batch during reassignment"
+                ))
+            })
+        })
+        .collect::<Result<Vec<u32>>>()?
+        .into();
+    let covering_schema = covering.schema();
+    for (i, field) in covering_schema.fields().iter().enumerate() {
+        if field.name() == ROW_ID {
+            continue;
+        }
+        let col = arrow::compute::take(covering.column(i), &take_idx, None)?;
+        batch = batch.try_with_column(field.as_ref().clone(), col)?;
+    }
+    Ok(batch)
+}
+
 fn apply_centroid_splits(
     original: &FixedSizeListArray,
     splits: &[(usize, ArrayRef, ArrayRef)],
@@ -135,6 +172,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     ivf_params: Option<IvfBuildParams>,
     quantizer_params: Option<Q::BuildParams>,
     sub_index_params: Option<S::BuildParams>,
+    /// Columns to co-locate ("include") in the index storage alongside the row
+    /// id and quantization code, so covered queries can avoid a take.
+    include_columns: Vec<String>,
     _temp_dir: TempStdDir, // store this for keeping the temp dir alive and clean up after build
     temp_dir: Path,
 
@@ -217,6 +257,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            include_columns: Vec::new(),
             format_version,
             progress: Arc::new(NoopIndexBuildProgress),
         })
@@ -259,6 +300,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .downcast_ref::<IVFIndex<S, Q>>()
             .ok_or(Error::invalid_input("existing index is not IVF index"))?;
 
+        // Carry the covering ("included") columns so the remapped storage keeps
+        // them -- otherwise merge_partitions would write a schema without them
+        // while the metadata still advertises them.
+        let include_columns = ivf_index.covering_column_names()?;
+
         let temp_dir = TempStdDir::default();
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
         let format_version = dataset_format_version(&dataset);
@@ -284,6 +330,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            include_columns,
             format_version,
             progress: Arc::new(NoopIndexBuildProgress),
         })
@@ -403,6 +450,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     /// This mainly affects intermediate PQ/RQ storage when building distributed indices.
     pub fn with_transpose(&mut self, transpose: bool) -> &mut Self {
         self.transpose_codes = transpose;
+        self
+    }
+
+    /// Set columns to co-locate ("include") in the index storage so covered
+    /// queries can avoid a take from the base table.
+    pub fn with_include_columns(&mut self, columns: Vec<String>) -> &mut Self {
+        self.include_columns = columns;
         self
     }
 
@@ -591,10 +645,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
             _ => {
                 log::info!("shuffle column {} over dataset", self.column);
+                // Read the vector column plus any included ("covering") columns
+                // so they flow through the shuffle into the partition storage.
+                let mut projection: Vec<&str> = Vec::with_capacity(1 + self.include_columns.len());
+                projection.push(self.column.as_str());
+                projection.extend(self.include_columns.iter().map(String::as_str));
                 let mut builder = dataset.scan();
                 builder
                     .batch_readahead(get_num_compute_intensive_cpus())
-                    .project(&[self.column.as_str()])?
+                    .project(&projection)?
                     .with_row_id();
 
                 // Apply fragment filter for distributed indexing
@@ -1149,6 +1208,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         } else {
             let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
             fields.extend(quantizer.extra_fields());
+            // Append any included ("covering") columns so they are persisted in
+            // the auxiliary storage file alongside the row id and code.
+            if !self.include_columns.is_empty()
+                && let Some(ds) = self.dataset.as_ref()
+            {
+                let ds_schema = arrow_schema::Schema::from(ds.schema());
+                for name in &self.include_columns {
+                    let field = ds_schema.field_with_name(name).map_err(|e| {
+                        Error::invalid_input(format!(
+                            "include column '{name}' not found in dataset schema: {e}"
+                        ))
+                    })?;
+                    fields.push(field.clone());
+                }
+            }
             let storage_schema: Schema = (&arrow_schema::Schema::new(fields)).try_into()?;
             Some(FileWriter::try_new(
                 self.store.create(&storage_path).await?,
@@ -1379,14 +1453,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     // take raw vectors from the dataset
     //
-    // returns batches of schema | row_id | vector |
+    // returns batches of schema | row_id | vector | <covering cols...> |
     async fn take_vectors(
         dataset: &Dataset,
         column: &str,
         store: &ObjectStore,
         row_ids: &[u64],
+        include_columns: &[String],
     ) -> Result<Vec<RecordBatch>> {
-        let projection = Arc::new(dataset.schema().project(&[column])?);
+        let mut proj_columns: Vec<&str> = vec![column];
+        proj_columns.extend(include_columns.iter().map(String::as_str));
+        let projection = Arc::new(dataset.schema().project(&proj_columns)?);
         // arrow uses i32 for index, so we chunk the row ids to avoid large batch causing overflow
         let mut batches = Vec::new();
         let row_ids = dataset.filter_deleted_ids(row_ids).await?;
@@ -1410,11 +1487,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(batches)
     }
 
-    // helper to load row ids and vectors for a partition
+    // helper to load row ids and vectors for a partition, plus a covering batch
+    // `[_rowid, <included cols...>]` (None when the index has no covering columns)
+    // so the columns can be re-attached to reassigned rows after quantization.
     async fn load_partition_raw_vectors(
         &self,
         part_idx: usize,
-    ) -> Result<Option<(UInt64Array, FixedSizeListArray)>> {
+    ) -> Result<Option<(UInt64Array, FixedSizeListArray, Option<RecordBatch>)>> {
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
                 "dataset not set before split partition",
@@ -1428,11 +1507,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // dedup is needed if it's multivector
         row_ids.dedup();
 
-        let batches = Self::take_vectors(dataset, &self.column, &self.store, &row_ids).await?;
+        let batches = Self::take_vectors(
+            dataset,
+            &self.column,
+            &self.store,
+            &row_ids,
+            &self.include_columns,
+        )
+        .await?;
         if batches.is_empty() {
             return Ok(None);
         }
         let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+        // Extract the covering columns BEFORE flattening. For multivector (List)
+        // vectors, `Flatten` rebuilds the batch as just `[_rowid, vector]` and
+        // drops the included columns; the pre-flatten batch has one row per row
+        // id, which is what the later gather-by-row-id expects.
+        let covering = if self.include_columns.is_empty() {
+            None
+        } else {
+            let mut indices = vec![batch.schema().index_of(ROW_ID)?];
+            for name in &self.include_columns {
+                indices.push(batch.schema().index_of(name)?);
+            }
+            Some(batch.project(&indices)?)
+        };
         // for multivector, we need to flatten the vectors
         let batch = Flatten::new(&self.column).transform(&batch)?;
         // need to retrieve the row ids from the batch because some rows may have been deleted
@@ -1446,7 +1545,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             )))?
             .as_fixed_size_list()
             .clone();
-        Ok(Some((row_ids, vectors)))
+        Ok(Some((row_ids, vectors, covering)))
     }
 
     // check whether need to split or join partition
@@ -1638,8 +1737,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         all_row_ids.sort();
         all_row_ids.dedup();
 
-        // Stream raw vectors in chunks
-        let projection = Arc::new(dataset.schema().project(&[self.column.as_str()])?);
+        // Stream raw vectors plus any covering ("included") columns so a
+        // partition split preserves them in the re-quantized storage.
+        let mut split_projection: Vec<&str> = vec![self.column.as_str()];
+        split_projection.extend(self.include_columns.iter().map(String::as_str));
+        let projection = Arc::new(dataset.schema().project(&split_projection)?);
         let row_ids = dataset.filter_deleted_ids(&all_row_ids).await?;
         let block_size = self.store.block_size();
         let column = self.column.clone();
@@ -1748,7 +1850,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             row_ids = (0..sample_size).map(|i| row_ids[i * stride]).collect();
         }
 
-        let batches = Self::take_vectors(dataset, &self.column, &self.store, &row_ids).await?;
+        // Centroid sampling only needs the vectors, not covering columns.
+        let batches = Self::take_vectors(dataset, &self.column, &self.store, &row_ids, &[]).await?;
         if batches.is_empty() {
             return Ok(None);
         }
@@ -1825,8 +1928,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let new_centroids =
             FixedSizeListArray::try_new_from_values(new_centroids, centroids.value_length())?;
 
-        // take the raw vectors from dataset
-        let Some((row_ids, vectors)) = self.load_partition_raw_vectors(part_idx).await? else {
+        // take the raw vectors from dataset (plus any covering columns)
+        let Some((row_ids, vectors, covering)) = self.load_partition_raw_vectors(part_idx).await?
+        else {
             return Ok(AssignResult {
                 assign_batches: vec![None; ivf.num_partitions() - 1],
                 new_centroids,
@@ -1840,6 +1944,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ivf,
                     &row_ids,
                     &vectors,
+                    covering.as_ref(),
                     new_centroids,
                 )
                 .await
@@ -1850,6 +1955,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ivf,
                     &row_ids,
                     &vectors,
+                    covering.as_ref(),
                     new_centroids,
                 )
                 .await
@@ -1860,6 +1966,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ivf,
                     &row_ids,
                     &vectors,
+                    covering.as_ref(),
                     new_centroids,
                 )
                 .await
@@ -1870,6 +1977,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ivf,
                     &row_ids,
                     &vectors,
+                    covering.as_ref(),
                     new_centroids,
                 )
                 .await
@@ -1887,6 +1995,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         ivf: &IvfModel,
         row_ids: &UInt64Array,
         vectors: &FixedSizeListArray,
+        // `[_rowid, <included cols...>]` for the reassigned rows, or None when the
+        // index has no covering columns. Re-attached to each assign batch by row id.
+        covering: Option<&RecordBatch>,
         new_centroids: FixedSizeListArray,
     ) -> Result<AssignResult>
     where
@@ -1929,6 +2040,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             assign_ops[new_part_id(idx as usize)].push(AssignOp::Add((row_id, vectors.value(i))));
         }
         let assign_batches = self.build_assign_batch::<T>(&new_centroids, &assign_ops)?;
+
+        // Re-attach the covering columns to each reassigned batch, gathered by
+        // row id (in-memory; the rows were reordered across target partitions).
+        let assign_batches = match covering {
+            None => assign_batches,
+            Some(covering) => assign_batches
+                .into_iter()
+                .map(|entry| match entry {
+                    Some((batch, deleted)) => {
+                        Ok(Some((append_covering_by_row_id(batch, covering)?, deleted)))
+                    }
+                    None => Ok(None),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
 
         Ok(AssignResult {
             assign_batches,

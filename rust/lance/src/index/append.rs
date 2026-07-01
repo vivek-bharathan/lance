@@ -468,6 +468,14 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         )))?;
 
     let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
+    // Covering ("included") columns recorded on the index, resolved to names.
+    // Threaded into the merge builder and projected into the new-data scan so
+    // they survive optimize/merge and partition split/join.
+    let covering_columns: Vec<String> = old_indices[0]
+        .included_fields
+        .iter()
+        .filter_map(|id| dataset.schema().field_by_id(*id).map(|f| f.name.clone()))
+        .collect();
     let first_is_vector_index = metadata_is_vector_index(dataset.as_ref(), old_indices[0]).await?;
     for idx in old_indices.iter().skip(1) {
         let is_vector_index = metadata_is_vector_index(dataset.as_ref(), idx).await?;
@@ -574,6 +582,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 &field_path,
                 &selected_ivf_view,
                 options,
+                &covering_columns,
             ))
             .await?;
             if indices_merged == 0 {
@@ -602,10 +611,15 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 None
             } else {
                 let mut scanner = dataset.scan();
+                // Project the vector column plus any covering columns so rows
+                // from the newly-indexed fragments carry the same columns as the
+                // existing partitions.
+                let mut projection: Vec<&str> = vec![field_path.as_str()];
+                projection.extend(covering_columns.iter().map(String::as_str));
                 scanner
                     .with_fragments(unindexed.to_vec())
                     .with_row_id()
-                    .project(&[&field_path])?;
+                    .project(&projection)?;
                 if column.nullable {
                     let column_expr =
                         lance_datafusion::logical_expr::field_path_to_expr(&field_path)?;
@@ -620,6 +634,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 &field_path,
                 &ivf_view,
                 options,
+                &covering_columns,
             )
             .boxed()
             .await?;
